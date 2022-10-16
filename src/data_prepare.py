@@ -11,8 +11,8 @@ if __name__ == "__main__":
             if p1 != p2 and pro_seqs[p1] == pro_seqs[p2]:
                 print(p1, p2)
     
-    pos_pros = [n.split(".")[0] for n in os.listdir("./data/pdb-neg")]
-    neg_pros = [n.split(".")[0] for n in os.listdir("./data/pdb-pos")]
+    pos_pros = [n.split(".")[0] for n in os.listdir("./data/pdb-pos")]
+    neg_pros = [n.split(".")[0] for n in os.listdir("./data/pdb-neg")]
     pos_pros = [p for p in pos_pros if p in pro_seqs]
     neg_pros = [p for p in neg_pros if p in pro_seqs]
 

@@ -1,1 +1,3 @@
-python src/train.py
+python src/train.py \
+    --withseq \
+    --withstru 
