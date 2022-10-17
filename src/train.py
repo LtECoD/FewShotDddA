@@ -4,7 +4,11 @@ import argparse
 import numpy as np
 import torch.nn as nn
 
-from tqdm import tqdm
+from sklearn.metrics import confusion_matrix
+from sklearn.metrics import accuracy_score
+from sklearn.metrics import precision_score, recall_score, f1_score
+
+
 from torch.utils.data import Dataset
 
 from utils import read_file, write_file, pad
@@ -32,6 +36,12 @@ class FSDataset(Dataset):
     def __len__(self):
         return len(self.samples)
     
+    def __str__(self):
+        pos_samples = [s for idx, s in enumerate(self.samples) if self.labels[idx] == 1]
+        neg_samples = [s for idx, s in enumerate(self.samples) if self.labels[idx] == 0]
+
+        return f"{len(pos_samples)} positive samples: {pos_samples}\n{len(neg_samples)} negative samples: {neg_samples}"
+
 
 class Reader:
     def __init__(self):
@@ -44,20 +54,17 @@ class Reader:
             self.seq_embs[n] = torch.Tensor(np.load(f"./embs/seq/{n}.npy"))
             self.stru_embs[n] = torch.load(f"./embs/stru/{n}_mifst_per_tok.pt")
 
-    def split(self, ratio):
-        samples = self.pos_samples + self.neg_samples
-        labels = [1] * len(self.pos_samples) + [0] * len(self.neg_samples)
+    def split(self, test_pos_num):
+        test_pos = random.sample(set(self.pos_samples)-set(['6U08']), test_pos_num)      # 6U08 must in train
+        train_pos = list(set(self.pos_samples) - set(test_pos))
 
-        zipped = list(zip(samples, labels))
-        random.shuffle(zipped)        
-        samples, labels = list(zip(*zipped))
-    
-        train_size = int(len(samples) * ratio)
-        train_samples = samples[: train_size]
-        train_labels = labels[: train_size]
-        test_samples = samples[train_size: ]
-        test_labels = labels[train_size: ]
-        # each split should have at least two positive samples
+        test_neg = random.sample(self.neg_samples, int(len(self.neg_samples)*0.2))      # 4:1 for neg samples
+        train_neg = list(set(self.neg_samples) - set(test_neg))
+        
+        train_samples = train_pos + train_neg
+        train_labels = [1] * len(train_pos) + [0] * len(train_neg)
+        test_samples = test_pos + test_neg
+        test_labels = [1] * len(test_pos) + [0] * len(test_neg)
         assert sum(train_labels) >=2 and sum(test_labels) >= 2
 
         trainset = FSDataset(
@@ -127,41 +134,96 @@ class Model(nn.Module):
         score_mat = torch.exp(score_mat)
         return score_mat
 
-    def get_loss(self, score_mat, labels):
+    def get_loss(self, score_mat, support_labels, query_labels, exclude_self=False):
         """
         Args:
-            score_mat   : qnum x snum
-            labels      : snum
+            score_mat           : qnum x snum
+            support_labels      : snum
+            query_labels        : qnum
         """
         qnum, snum = score_mat.size()
-        assert qnum == snum
 
-        # exclude self scores
-        score_mat.fill_diagonal_(0)
-        mean_scores = torch.sum(score_mat, dim=-1) / (qnum - 1)    # qnum
+        # exclude self scores, fill_diagonal cannot be used as its an in-place operation
+        if exclude_self:
+            assert qnum == snum
+            score_mat = torch.where(
+                torch.eye(qnum).bool().to(score_mat.device),
+                torch.zeros_like(score_mat),
+                score_mat)
 
-        mask = labels.unsqueeze(0).repeat(qnum, 1)
-        mask.fill_diagonal_(-1)
-        pos_mask = mask == 1
-        neg_mask = mask == 0
-        
-        pos_scores = torch.sum(
-            torch.where(pos_mask, score_mat, torch.zeros_like(score_mat)), dim=-1)         # qnum
-        mean_pos_scores = pos_scores / torch.sum(pos_mask, dim=-1)  # qnum
-        neg_scores = torch.sum(
-            torch.where(neg_mask, score_mat, torch.zeros_like(score_mat)), dim=-1)         # qnum
-        mean_neg_scores = neg_scores / torch.sum(neg_mask, dim=-1)  # qnum
+        mask = (query_labels.unsqueeze(1) == support_labels.unsqueeze(0)).long().to(score_mat.device) # qnum x snum
+        # caculate scores of the same class
+        if exclude_self:
+            same_mask = torch.where(
+                torch.eye(qnum).bool().to(mask.device),
+                torch.zeros_like(mask),
+                mask)
+        else:
+            same_mask = mask
+        assert (torch.sum(same_mask, dim=-1)>0).all()
+        same_scores = torch.sum(
+            torch.where(same_mask.bool(), score_mat, torch.zeros_like(score_mat)), dim=-1)  # qnum
+        mean_same_scores = same_scores / torch.sum(same_mask, dim=-1)   # qnum
+       
+        # caculate scores of diff class
+        diff_mask = 1 - mask
+        if exclude_self:
+            assert (torch.diagonal(diff_mask) == 0).all()
+        assert (torch.sum(diff_mask, dim=-1)>0).all()
+        diff_scores = torch.sum(
+            torch.where(diff_mask.bool(), score_mat, torch.zeros_like(score_mat)), dim=-1)
+        mean_diff_scores = diff_scores / torch.sum(diff_mask, dim=-1)
 
-        # todo
-        raise NotImplementedError
+        loss = -1. * torch.log(mean_same_scores / (mean_same_scores + mean_diff_scores))
+        return torch.mean(loss)
     
-    def infer(self, score_mat, labels):
-        raise NotImplementedError
+    def infer(self, score_mat, support_labels, exclude_self=False):
+        qnum, snum = score_mat.size()
+        mask = support_labels.unsqueeze(0).repeat(qnum, 1)      # qnum x snum
+        if exclude_self:
+            mask.fill_diagonal_(-1)
 
+        pos_scores = torch.sum(
+            torch.where(mask==1, score_mat, torch.zeros_like(score_mat)), dim=-1)
+        pos_mean_scores = pos_scores / torch.sum(mask==1, dim=-1)                   # qnum
+
+        neg_scores = torch.sum(
+            torch.where(mask==0, score_mat, torch.zeros_like(score_mat)), dim=-1)
+        neg_mean_scores = neg_scores / torch.sum(mask==0, dim=-1)                   # qnum
+
+        pred = (pos_mean_scores > neg_mean_scores).long()
+        return pred
+
+
+def forward_model(args, dataset, model):
+    samples, seq_embs, stru_embs, lens, labels = dataset.get()
+    if not args.withseq:
+        seq_embs = None
+    if not args.withstru:
+        stru_embs = None
+    
+    # forward model
+    out = model(seq_embs, stru_embs, lens)
+    return samples, labels, out
+
+
+def evaluate(pred, labels):
+    pred = pred.numpy()
+    labels = labels.numpy()
+
+    precision = precision_score(y_true=labels, y_pred=pred, zero_division=0)
+    recall = recall_score(y_true=labels, y_pred=pred)
+    f1 = f1_score(y_true=labels, y_pred=pred)
+    acc = accuracy_score(y_true=labels, y_pred=pred)
+    confumat = confusion_matrix(y_true=labels, y_pred=pred)
+    return precision, recall, f1, acc, confumat
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    # data arguments
+    parser.add_argument("--testposnum", type=int, default=2)
+
     # model arguments
     parser.add_argument("--withseq", action="store_true", help="use seq embeddings")
     parser.add_argument("--withstru", action="store_true", help="use structure embedding")
@@ -171,38 +233,54 @@ if __name__ == "__main__":
     parser.add_argument("--dropout", type=float, default=0.2)
 
     # train arguments
-    parser.add_argument("--seed", type=int, default=100)
-    parser.add_argument("--trainratio", type=float, default=0.7)
-    parser.add_argument("--steps", type=int, default=50)
+    parser.add_argument("--seed", type=int, default=99)
+    parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--lr", type=int, default=1e-4)
 
     args = parser.parse_args()
     setup_seed(args.seed)
 
-    trainset, testset = Reader().split(args.trainratio)
+    trainset, testset = Reader().split(args.testposnum)
+    print(f"Trainset:\n{trainset}")
+    print()
+    print(f"Testset:\n{testset}")
+    print()
+
     model = Model(args)
     optimizer = torch.optim.Adam(params=model.parameters(), lr=args.lr)
+    print(model)
 
-    iterator = tqdm(range(args.steps))
-    for idx in iterator:
-        samples, seq_embs, stru_embs, lens, labels = trainset.get()
-        if not args.withseq:
-            seq_embs = None
-        if not args.withstru:
-            stru_embs = None
-        
-        # forward model
-        out = model(seq_embs, stru_embs, lens)
-        score_mat = model.get_score_mat(support_out=out, query_out=out)
-        loss = model.get_loss(score_mat=score_mat, labels=labels)
-        
+    best_loss = 10000.
+    for idx in range(args.steps):
+        print(f"Epoch: {idx}", end=" ||| ")
+
+        # train
+        train_samples, train_labels, train_out = forward_model(args, trainset, model)
+        score_mat = model.get_score_mat(support_out=train_out, query_out=train_out)
+        loss = model.get_loss(
+            score_mat=score_mat, support_labels=train_labels, query_labels=train_labels, exclude_self=True)
+
         # update parameter
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        print(f"Train: loss-{round(float(loss), 4)}", end=" ")
+
+        # evaluate
+        pred = model.infer(score_mat, support_labels=train_labels, exclude_self=True)
+        precision, recall, f1, acc, confumat = evaluate(pred, train_labels)
+        print(f"p-{round(precision, 4)}, r-{round(recall, 4)}, f-{round(f1, 4)}, a-{round(acc, 4)}", end=" ")
+        # print(confumat)
 
         # validate
-        # todo
-
-        
+        model.eval()
+        test_samples, test_labels, test_out = forward_model(args, testset, model)
+        test_score_mat = model.get_score_mat(support_out=train_out, query_out=test_out)
+        test_loss = model.get_loss(
+            score_mat=test_score_mat, support_labels=train_labels, query_labels=test_labels)
+        print(f"||| Test: loss-{round(float(test_loss), 4)}", end=" ")
+        test_pred = model.infer(test_score_mat, support_labels=train_labels)
+        precision, recall, f1, acc, confumat = evaluate(test_pred, test_labels)
+        print(f"p-{round(precision, 4)}, r-{round(recall, 4)}, f-{round(f1, 4)}, a-{round(acc, 4)}")
+        model.train()
         
