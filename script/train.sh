@@ -1,4 +1,4 @@
 python src/train.py \
-    --testposnum 3 \
+    --testposnum 4 \
     --withseq \
     --withstru \

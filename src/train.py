@@ -1,3 +1,5 @@
+from copy import deepcopy
+import os
 import torch
 import random
 import argparse
@@ -55,8 +57,11 @@ class Reader:
             self.stru_embs[n] = torch.load(f"./embs/stru/{n}_mifst_per_tok.pt")
 
     def split(self, test_pos_num):
-        test_pos = random.sample(set(self.pos_samples)-set(['6U08']), test_pos_num)      # 6U08 must in train
+        ava_pos = deepcopy(self.pos_samples)                 # sample set is not stable via random seeds
+        ava_pos.remove("6U08")
+        test_pos = random.sample(ava_pos, test_pos_num)      # 6U08 must in train
         train_pos = list(set(self.pos_samples) - set(test_pos))
+
 
         test_neg = random.sample(self.neg_samples, int(len(self.neg_samples)*0.2))      # 4:1 for neg samples
         train_neg = list(set(self.neg_samples) - set(test_neg))
@@ -92,9 +97,11 @@ class Model(nn.Module):
         self.module = nn.Sequential(
             nn.Linear(in_dim, args.hiddim),
             nn.ReLU(), nn.Dropout(args.dropout),
-            nn.Linear(args.hiddim, args.hiddim),
-            nn.ReLU(), nn.Dropout(args.dropout),
-            nn.Linear(args.hiddim, args.hiddim))
+            nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(d_model=args.hiddim, nhead=1, \
+                    dim_feedforward=args.hiddim*4, dropout=args.dropout, batch_first=True), 
+                num_layers=2)
+        )
 
     def forward(self, seq_embs, stru_embs, lens):
         """
@@ -202,7 +209,6 @@ def forward_model(args, dataset, model):
     if not args.withstru:
         stru_embs = None
     
-    # forward model
     out = model(seq_embs, stru_embs, lens)
     return samples, labels, out
 
@@ -234,7 +240,7 @@ if __name__ == "__main__":
 
     # train arguments
     parser.add_argument("--seed", type=int, default=99)
-    parser.add_argument("--steps", type=int, default=200)
+    parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--lr", type=int, default=1e-4)
 
     args = parser.parse_args()
@@ -250,6 +256,11 @@ if __name__ == "__main__":
     optimizer = torch.optim.Adam(params=model.parameters(), lr=args.lr)
     print(model)
 
+    suffix = f"_{args.testposnum}"
+    if args.withseq:
+        suffix = suffix + "_seq"
+    if args.withstru:
+        suffix = suffix + "_stru"
     best_loss = 10000.
     for idx in range(args.steps):
         print(f"Epoch: {idx}", end=" ||| ")
@@ -270,7 +281,6 @@ if __name__ == "__main__":
         pred = model.infer(score_mat, support_labels=train_labels, exclude_self=True)
         precision, recall, f1, acc, confumat = evaluate(pred, train_labels)
         print(f"p-{round(precision, 4)}, r-{round(recall, 4)}, f-{round(f1, 4)}, a-{round(acc, 4)}", end=" ")
-        # print(confumat)
 
         # validate
         model.eval()
@@ -283,4 +293,23 @@ if __name__ == "__main__":
         precision, recall, f1, acc, confumat = evaluate(test_pred, test_labels)
         print(f"p-{round(precision, 4)}, r-{round(recall, 4)}, f-{round(f1, 4)}, a-{round(acc, 4)}")
         model.train()
-        
+
+        results = [
+            f"Step:\t{idx}\n",
+            f"Loss:\t{round(float(loss), 4)}\n",
+            f"Precision:\t{round(precision, 4)}\n",
+            f"Recall:\t{round(recall, 4)}\n",
+            f"F1:\t{round(f1, 4)}\n",
+            f"Acc:\t{round(acc, 4)}"]
+        predictions = [f"{s}\t{int(l)}\t{int(p)}\n" for s, l, p in zip(test_samples, test_labels, test_pred)]
+
+        if float(test_loss) < best_loss:
+            torch.save(model.state_dict(), os.path.join("./save", f"best_model{suffix}.ckpt"))
+            write_file(os.path.join("./results", f"best_results{suffix}.tsv"), results)
+            write_file(os.path.join("./results", f"best_pred{suffix}.tsv"), predictions, header="Protein\tLabel\tPred\n")
+            best_loss = float(test_loss)
+
+        if idx == args.steps-1:
+            torch.save(model.state_dict(), os.path.join("./save", f"last_model{suffix}.ckpt"))
+            write_file(os.path.join("./results", f"last_results{suffix}.tsv"), results)
+            write_file(os.path.join("./results", f"last_pred{suffix}.tsv"), predictions, header="Protein\tLabel\tPred\n")
